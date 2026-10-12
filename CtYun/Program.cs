@@ -23,6 +23,8 @@ Console.CancelKeyPress += (s, e) =>
     globalCts.Cancel();
 };
 
+Utility.WriteLine(ConsoleColor.Green, $"保活周期：{runtimeConfig.KeepAliveSeconds} 秒，随机抖动：±{runtimeConfig.KeepAliveJitterPercent}%，睡眠时段：{(runtimeConfig.SleepWindows.Count == 0 ? "未设置" : string.Join(",", runtimeConfig.SleepWindows) + $"（恢复偏移 0~{runtimeConfig.SleepJitterMinutes} 分钟）")}，时区：{TimeZoneInfo.Local.Id}");
+
 var sessionTasks = runtimeConfig.Accounts.Select(account => RunAccountAsync(account, runtimeConfig, globalCts.Token));
 
 try
@@ -80,7 +82,7 @@ async Task RunAccountAsync(AccountConfig account, RuntimeConfig runtimeConfig, C
     }
 
     Utility.WriteLine(ConsoleColor.Yellow, $"[{label}] 保活任务启动：每 {runtimeConfig.KeepAliveSeconds} 秒强制重连一次。");
-    var keepAliveTasks = activeDesktops.Select(d => KeepAliveWorkerWithForcedReset(api, account, d, runtimeConfig.KeepAliveSeconds, ct));
+    var keepAliveTasks = activeDesktops.Select(d => KeepAliveWorkerWithForcedReset(api, account, d, runtimeConfig, ct));
     await Task.WhenAll(keepAliveTasks);
 }
 
@@ -126,19 +128,39 @@ string ReadVerificationCode(AccountConfig account)
     return Console.ReadLine();
 }
 
-async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, Desktop desktop, int keepAliveSeconds, CancellationToken globalToken)
+async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, Desktop desktop, RuntimeConfig runtimeConfig, CancellationToken globalToken)
 {
     var label = AccountLabel(account);
     var initialPayload = Convert.FromBase64String("UkVEUQIAAAACAAAAGgAAAAAAAAABAAEAAAABAAAAEgAAAAkAAAAECAAA");
-    var uri = new Uri($"wss://{desktop.DesktopInfo.ClinkLvsOutHost}/clinkProxy/{desktop.DesktopId}/MAIN");
 
     while (!globalToken.IsCancellationRequested)
     {
+        if (GetSleepRemaining(runtimeConfig.SleepWindows, DateTime.Now) is { } sleepRemaining)
+        {
+            // 恢复时间加随机偏移，避免每天在同一分钟准时恢复
+            if (runtimeConfig.SleepJitterMinutes > 0)
+            {
+                sleepRemaining += TimeSpan.FromSeconds(Random.Shared.Next(0, runtimeConfig.SleepJitterMinutes * 60 + 1));
+            }
+            Utility.WriteLine(ConsoleColor.Yellow, $"[{label}][{desktop.DesktopCode}] 进入睡眠时段，暂停保活 {FormatDuration(sleepRemaining)}，预计 {DateTime.Now.Add(sleepRemaining):MM-dd HH:mm} 恢复。");
+            await Task.Delay(sleepRemaining, globalToken);
+            Utility.WriteLine(ConsoleColor.Cyan, $"[{label}][{desktop.DesktopCode}] 睡眠结束，刷新连接信息。");
+            if (!await RefreshDesktopInfoAsync(api, account, desktop))
+            {
+                await Task.Delay(TimeSpan.FromSeconds(60), globalToken);
+                continue;
+            }
+        }
+
+        var keepAliveSeconds = ApplyJitter(runtimeConfig.KeepAliveSeconds, runtimeConfig.KeepAliveJitterPercent);
+        var uri = new Uri($"wss://{desktop.DesktopInfo.ClinkLvsOutHost}/clinkProxy/{desktop.DesktopId}/MAIN");
+
         using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(globalToken);
         sessionCts.CancelAfter(TimeSpan.FromSeconds(keepAliveSeconds));
 
         using var client = new ClientWebSocket();
         client.Options.SetRequestHeader("Origin", "https://pc.ctyun.cn");
+        client.Options.SetRequestHeader("User-Agent", CtYunApi.UserAgent);
         client.Options.AddSubProtocol("binary");
 
         try
@@ -190,6 +212,30 @@ async Task KeepAliveWorkerWithForcedReset(CtYunApi api, AccountConfig account, D
             }
         }
     }
+}
+
+// 睡眠结束后刷新云电脑连接信息；如果会话已失效则尝试重新登录一次。
+async Task<bool> RefreshDesktopInfoAsync(CtYunApi api, AccountConfig account, Desktop desktop)
+{
+    var label = AccountLabel(account);
+    var result = await api.ConnectAsync(desktop.DesktopId);
+    if (!result.Success || result.Data?.DesktopInfo == null)
+    {
+        Utility.WriteLine(ConsoleColor.Yellow, $"[{label}][{desktop.DesktopCode}] 刷新连接失败（{result.Msg}），尝试重新登录。");
+        if (!await api.LoginAsync(account.User, account.Password))
+        {
+            Utility.WriteLine(ConsoleColor.Red, $"[{label}] 重新登录失败，60 秒后重试。");
+            return false;
+        }
+        result = await api.ConnectAsync(desktop.DesktopId);
+        if (!result.Success || result.Data?.DesktopInfo == null)
+        {
+            Utility.WriteLine(ConsoleColor.Red, $"[{label}][{desktop.DesktopCode}] 重新登录后刷新连接仍失败：{result.Msg}，60 秒后重试。");
+            return false;
+        }
+    }
+    desktop.DesktopInfo = result.Data.DesktopInfo;
+    return true;
 }
 
 async Task ReceiveLoop(CtYunApi api, ClientWebSocket ws, AccountConfig account, Desktop desktop, CancellationToken ct)
@@ -256,8 +302,93 @@ RuntimeConfig LoadRuntimeConfig()
         account.DeviceCode = ResolveDeviceCode(account, dataDir);
     }
 
-    return new RuntimeConfig(config.Accounts, Math.Max(10, config.KeepAliveSeconds), dataDir);
+    // 环境变量优先级高于 accounts.json
+    var keepAliveSeconds = Math.Max(10, ReadIntEnv("KEEP_ALIVE_SECONDS") ?? config.KeepAliveSeconds);
+    var jitterPercent = Math.Clamp(ReadIntEnv("KEEP_ALIVE_JITTER") ?? config.KeepAliveJitterPercent, 0, 90);
+    var sleepWindows = ParseSleepWindows(FirstNotEmpty(Environment.GetEnvironmentVariable("SLEEP_WINDOW"), config.SleepWindow));
+    var sleepJitterMinutes = Math.Clamp(ReadIntEnv("SLEEP_JITTER_MINUTES") ?? config.SleepJitterMinutes, 0, 180);
+
+    return new RuntimeConfig(config.Accounts, keepAliveSeconds, jitterPercent, sleepWindows, sleepJitterMinutes, dataDir);
 }
+
+static int? ReadIntEnv(string name)
+{
+    var raw = Environment.GetEnvironmentVariable(name);
+    if (string.IsNullOrWhiteSpace(raw))
+    {
+        return null;
+    }
+    if (int.TryParse(raw.Trim(), out var value))
+    {
+        return value;
+    }
+    Utility.WriteLine(ConsoleColor.Yellow, $"环境变量 {name} 不是合法整数，已忽略：{raw}");
+    return null;
+}
+
+// 解析 "HH:mm-HH:mm[,HH:mm-HH:mm...]"，支持跨午夜，例如 "23:30-06:45"
+static List<SleepWindow> ParseSleepWindows(string raw)
+{
+    var windows = new List<SleepWindow>();
+    if (string.IsNullOrWhiteSpace(raw))
+    {
+        return windows;
+    }
+
+    foreach (var part in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+    {
+        var range = part.Split('-', 2, StringSplitOptions.TrimEntries);
+        if (range.Length != 2
+            || !TimeOnly.TryParseExact(range[0], ["HH:mm", "H:mm"], out var start)
+            || !TimeOnly.TryParseExact(range[1], ["HH:mm", "H:mm"], out var end))
+        {
+            Utility.WriteLine(ConsoleColor.Yellow, $"睡眠时段格式错误，已忽略：{part}（应为 HH:mm-HH:mm）");
+            continue;
+        }
+        if (start == end)
+        {
+            Utility.WriteLine(ConsoleColor.Yellow, $"睡眠时段起止相同，已忽略：{part}");
+            continue;
+        }
+        windows.Add(new SleepWindow(start, end));
+    }
+    return windows;
+}
+
+// 当前处于睡眠时段时返回距离该时段结束的时长，否则返回 null
+static TimeSpan? GetSleepRemaining(List<SleepWindow> windows, DateTime now)
+{
+    var current = TimeOnly.FromDateTime(now);
+    foreach (var window in windows)
+    {
+        if (!window.Contains(current))
+        {
+            continue;
+        }
+        var end = now.Date.Add(window.End.ToTimeSpan());
+        if (end <= now)
+        {
+            end = end.AddDays(1);
+        }
+        // 多等 1 秒，确保醒来时已经离开该时段
+        return end - now + TimeSpan.FromSeconds(1);
+    }
+    return null;
+}
+
+static int ApplyJitter(int baseSeconds, int jitterPercent)
+{
+    if (jitterPercent <= 0)
+    {
+        return baseSeconds;
+    }
+    var delta = baseSeconds * jitterPercent / 100;
+    return Math.Max(10, baseSeconds + Random.Shared.Next(-delta, delta + 1));
+}
+
+static string FormatDuration(TimeSpan span) => span.TotalHours >= 1
+    ? $"{(int)span.TotalHours} 小时 {span.Minutes} 分钟"
+    : $"{(int)Math.Ceiling(span.TotalMinutes)} 分钟";
 
 AppConfig LoadAccountsFromEnvironment()
 {
@@ -429,4 +560,17 @@ static bool IsRunningInContainer() => File.Exists("/.dockerenv");
 record RuntimeConfig(
     List<AccountConfig> Accounts,
     int KeepAliveSeconds,
+    int KeepAliveJitterPercent,
+    List<SleepWindow> SleepWindows,
+    int SleepJitterMinutes,
     string DataDir);
+
+record SleepWindow(TimeOnly Start, TimeOnly End)
+{
+    // Start < End 为当日区间；Start > End 为跨午夜区间
+    public bool Contains(TimeOnly time) => Start < End
+        ? time >= Start && time < End
+        : time >= Start || time < End;
+
+    public override string ToString() => $"{Start:HH:mm}-{End:HH:mm}";
+}

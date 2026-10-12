@@ -22,6 +22,8 @@ CtYun 用于登录天翼云电脑并维持 WebSocket 保活连接。当前版本
 ```json
 {
   "keepAliveSeconds": 60,
+  "keepAliveJitterPercent": 20,
+  "sleepWindow": "02:00-07:00",
   "accounts": [
     {
       "name": "account-a",
@@ -147,6 +149,34 @@ docker run -d \
 ```
 
 `OCR_URL` 未设置或不是合法的 http/https 地址时，会回退为内置默认地址。
+
+## 保活周期、随机抖动与睡眠时段
+
+以下参数既可写在 `accounts.json`，也可用环境变量指定，环境变量优先级更高：
+
+| 环境变量 | accounts.json 字段 | 说明 | 默认 |
+| --- | --- | --- | --- |
+| `KEEP_ALIVE_SECONDS` | `keepAliveSeconds` | 强制重连周期（秒），最小 10 | 60 |
+| `KEEP_ALIVE_JITTER` | `keepAliveJitterPercent` | 周期随机抖动百分比（0~90）。设为 20 表示每个周期在基准值 ±20% 内随机；0 或不设置为固定周期 | 0 |
+| `SLEEP_WINDOW` | `sleepWindow` | 睡眠时段，格式 `HH:mm-HH:mm`，支持跨午夜（如 `23:30-06:45`），多个时段用逗号分隔。处于该时段时暂停保活，结束后自动刷新连接并恢复；不设置则全天保活 | 无 |
+| `SLEEP_JITTER_MINUTES` | `sleepJitterMinutes` | 睡眠结束后随机推迟 0~N 分钟再恢复，避免每天同一分钟准时上线；0 为准时恢复 | 10 |
+| `USER_AGENT` | 无 | 请求 User-Agent。设备信息 `deviceModel`/`sysVersion` 会自动取 UA 括号内的平台片段，保持一致 | macOS Chrome 155 |
+| `TZ` | 无 | 容器时区，睡眠时段按此时区计算。Docker 默认是 UTC，务必设置 | UTC |
+
+登录时识别完图形验证码后会随机等待 1~3 秒再提交，最多重试 3 次，每次重试前随机等待 3~8 秒。
+
+Docker 示例：
+
+```bash
+docker run -d \
+  --name ctyun \
+  -v "$(pwd)/ctyun-data:/app/data" \
+  -e TZ=Asia/Shanghai \
+  -e KEEP_ALIVE_SECONDS=90 \
+  -e KEEP_ALIVE_JITTER=20 \
+  -e SLEEP_WINDOW="02:00-07:00" \
+  su3817807/ctyun:latest
+```
 
 ## 日志与保活
 

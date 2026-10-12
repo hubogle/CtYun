@@ -25,6 +25,17 @@ namespace CtYun
 
         private const string version = "103020001";
 
+        private const string defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
+
+        /// <summary>请求 User-Agent，可通过环境变量 USER_AGENT 覆盖。</summary>
+        public static readonly string UserAgent = ResolveUserAgent();
+
+        /// <summary>
+        /// 设备平台信息，取自 User-Agent 括号内的片段，与官方网页端一致，
+        /// 例如 "Macintosh; Intel Mac OS X 10_15_7" 或 "Windows NT 10.0; Win64; x64"。
+        /// </summary>
+        private static readonly string platformInfo = ExtractPlatformInfo(UserAgent);
+
         private const string deviceType = "60";
 
         private string _deviceCode;
@@ -37,7 +48,7 @@ namespace CtYun
             _deviceCode = deviceCode;
             var handler = new HttpClientHandler();
             client = new HttpClient(handler);
-            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
+            client.DefaultRequestHeaders.Add("User-Agent", UserAgent);
             client.DefaultRequestHeaders.Add("ctg-devicetype", deviceType);
             client.DefaultRequestHeaders.Add("ctg-version", version);
             client.DefaultRequestHeaders.Add("ctg-devicecode", deviceCode);
@@ -51,6 +62,10 @@ namespace CtYun
         {
             for (int i = 1; i < 4; i++)
             {
+                if (i > 1)
+                {
+                    await RetryDelayAsync();
+                }
                 var genChallengeData = await GetGenChallengeDataAsync();
                 if (genChallengeData == null)
                 {
@@ -61,6 +76,10 @@ namespace CtYun
                 {
                     continue;
                 }
+                // 模拟人工输入验证码的耗时，随机等待 1~3 秒后再提交登录
+                var loginDelayMs = Random.Shared.Next(1000, 3001);
+                Utility.WriteLine(ConsoleColor.White, $"等待 {loginDelayMs / 1000.0:0.0} 秒后提交登录。");
+                await Task.Delay(loginDelayMs);
                 var collection = new List<KeyValuePair<string, string>>
                 {
                     new("userAccount", userphone),
@@ -91,6 +110,10 @@ namespace CtYun
         {
             for (int i = 0; i < 3; i++)
             {
+                if (i > 0)
+                {
+                    await RetryDelayAsync();
+                }
                 var captchaCode = await GetCaptcha(await GetSmsCodeCaptcha());
                 if (!string.IsNullOrEmpty(captchaCode))
                 {
@@ -107,7 +130,7 @@ namespace CtYun
 
         public async Task<bool> BindingDeviceAsync(string verificationCode)
         {
-            var result = await PostAsync($"https://desk.ctyun.cn:8810/api/cdserv/client/device/binding?verificationCode={verificationCode}&deviceName=Chrome%E6%B5%8F%E8%A7%88%E5%99%A8&deviceCode={_deviceCode}&deviceModel=Windows+NT+10.0%3B+Win64%3B+x64&sysVersion=Windows+NT+10.0%3B+Win64%3B+x64&appVersion=3.2.0&hostName=pc.ctyun.cn&deviceInfo=Win32", null, AppJsonSerializerContext.Default.ResultBaseBoolean);
+            var result = await PostAsync($"https://desk.ctyun.cn:8810/api/cdserv/client/device/binding?verificationCode={verificationCode}&deviceName=Chrome%E6%B5%8F%E8%A7%88%E5%99%A8&deviceCode={_deviceCode}&deviceModel={Uri.EscapeDataString(platformInfo)}&sysVersion={Uri.EscapeDataString(platformInfo)}&appVersion=3.2.0&hostName=pc.ctyun.cn&deviceInfo={(platformInfo.StartsWith("Macintosh") ? "MacIntel" : "Win32")}", null, AppJsonSerializerContext.Default.ResultBaseBoolean);
             if (result.Success)
             {
                 return true;
@@ -132,7 +155,7 @@ namespace CtYun
         {
             try
             {
-                return await client.GetByteArrayAsync("https://desk.ctyun.cn:8810/api/auth/client/captcha?height=36&width=85&userInfo=" + userphone + "&mode=auto&_t=1749139280909");
+                return await client.GetByteArrayAsync("https://desk.ctyun.cn:8810/api/auth/client/captcha?height=36&width=85&userInfo=" + userphone + "&mode=auto&_t=" + NowTimestamp());
             }
             catch (Exception ex)
             {
@@ -145,7 +168,7 @@ namespace CtYun
         {
             try
             {
-                return await GetByteAsync("https://desk.ctyun.cn:8810/api/auth/client/validateCode/captcha?width=120&height=40&_t=1766158569152");
+                return await GetByteAsync("https://desk.ctyun.cn:8810/api/auth/client/validateCode/captcha?width=120&height=40&_t=" + NowTimestamp());
             }
             catch (Exception ex)
             {
@@ -167,6 +190,31 @@ namespace CtYun
                 return defaultOcrUrl;
             }
             return url;
+        }
+
+        private static string ResolveUserAgent()
+        {
+            var ua = Environment.GetEnvironmentVariable("USER_AGENT")?.Trim();
+            return string.IsNullOrEmpty(ua) ? defaultUserAgent : ua;
+        }
+
+        private static string ExtractPlatformInfo(string ua)
+        {
+            var start = ua.IndexOf('(');
+            var end = start >= 0 ? ua.IndexOf(')', start) : -1;
+            if (start >= 0 && end > start + 1)
+            {
+                return ua.Substring(start + 1, end - start - 1).Trim();
+            }
+            return "Windows NT 10.0; Win64; x64";
+        }
+
+        /// <summary>重试前随机等待 3~8 秒，避免失败后瞬时连续请求。</summary>
+        private static async Task RetryDelayAsync()
+        {
+            var delayMs = Random.Shared.Next(3000, 8001);
+            Utility.WriteLine(ConsoleColor.White, $"等待 {delayMs / 1000.0:0.0} 秒后重试。");
+            await Task.Delay(delayMs);
         }
 
         private async Task<string> GetCaptcha(byte[] img)
@@ -295,11 +343,14 @@ namespace CtYun
             collection.Add(new KeyValuePair<string, string>("deviceCode", _deviceCode));
             collection.Add(new KeyValuePair<string, string>("deviceName", "Chrome浏览器"));
             collection.Add(new KeyValuePair<string, string>("deviceType", deviceType));
-            collection.Add(new KeyValuePair<string, string>("deviceModel", "Windows NT 10.0; Win64; x64"));
+            collection.Add(new KeyValuePair<string, string>("deviceModel", platformInfo));
             collection.Add(new KeyValuePair<string, string>("appVersion", "3.2.0"));
-            collection.Add(new KeyValuePair<string, string>("sysVersion", "Windows NT 10.0; Win64; x64"));
+            collection.Add(new KeyValuePair<string, string>("sysVersion", platformInfo));
             collection.Add(new KeyValuePair<string, string>("clientVersion", version));
         }
+
+        /// <summary>当前 Unix 毫秒时间戳，用于请求中的 _t 防缓存参数。</summary>
+        private static string NowTimestamp() => DateTimeOffset.Now.ToUnixTimeMilliseconds().ToString();
 
         private static string ComputeMD5(string input)
         {
