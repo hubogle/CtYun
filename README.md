@@ -15,6 +15,7 @@ CtYun 用于登录天翼云电脑并维持 WebSocket 保活连接。当前版本
 - Docker：默认数据目录为 `/app/data`，建议挂载到宿主机。
 - 也可以通过环境变量 `CTYUN_CONFIG` 指定配置文件路径。
 - 也可以通过环境变量 `CTYUN_DATA_DIR` 指定数据目录。
+- 也可以通过环境变量 `OCR_URL` 指定验证码识别（OCR）接口地址，未设置时使用内置默认地址。
 
 `accounts.json` 示例：
 
@@ -126,6 +127,26 @@ docker run -d \
 ```
 
 建议新部署优先使用 `accounts.json`，多账号管理更清晰，也更适合 Docker 持久化。
+
+## 自定义 OCR 接口
+
+登录时需要识别图形验证码，默认调用内置的 OCR 服务。如果想使用自建的 OCR 服务（例如基于 [ddddocr](https://github.com/sml2h3/ddddocr) 部署），可以通过环境变量 `OCR_URL` 指定完整地址，支持在地址中携带 token 等查询参数：
+
+```bash
+docker run -d \
+  --name ctyun \
+  -v "$(pwd)/ctyun-data:/app/data" \
+  -e OCR_URL="http://localhost:8000/ocr?token=YOUR_SECRET_TOKEN" \
+  su3817807/ctyun:latest
+```
+
+程序会以 `multipart/form-data` 方式 POST 到该地址，表单字段 `image` 为验证码图片的 Base64 字符串，期望返回 JSON，并从 `data` 字段读取识别结果，例如：
+
+```json
+{ "data": "a3f9" }
+```
+
+`OCR_URL` 未设置或不是合法的 http/https 地址时，会回退为内置默认地址。
 
 ## 日志与保活
 

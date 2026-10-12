@@ -15,7 +15,13 @@ namespace CtYun
     internal class CtYunApi
     {
 
-        private const string orcUrl = "https://orc.1999111.xyz/ocr";
+        private const string defaultOcrUrl = "https://orc.1999111.xyz/ocr";
+
+        /// <summary>
+        /// 验证码识别（OCR）接口地址，可通过环境变量 OCR_URL 覆盖，
+        /// 例如：http://localhost:8000/ocr?token=YOUR_SECRET_TOKEN
+        /// </summary>
+        private static readonly string ocrUrl = ResolveOcrUrl();
 
         private const string version = "103020001";
 
@@ -148,12 +154,27 @@ namespace CtYun
             }
         }
 
+        private static string ResolveOcrUrl()
+        {
+            var url = Environment.GetEnvironmentVariable("OCR_URL")?.Trim();
+            if (string.IsNullOrEmpty(url))
+            {
+                return defaultOcrUrl;
+            }
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            {
+                Utility.WriteLine(ConsoleColor.Yellow, "环境变量 OCR_URL 不是合法的 http/https 地址，已回退为默认 OCR 地址：" + url);
+                return defaultOcrUrl;
+            }
+            return url;
+        }
+
         private async Task<string> GetCaptcha(byte[] img)
         {
             try
             {
                 Utility.WriteLine(ConsoleColor.White, "正在识别验证码.");
-                using var request = new HttpRequestMessage(HttpMethod.Post, orcUrl);
+                using var request = new HttpRequestMessage(HttpMethod.Post, ocrUrl);
                 using var content = new MultipartFormDataContent {
                 {
                     new StringContent(Convert.ToBase64String(img)),
